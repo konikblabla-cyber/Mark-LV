@@ -80,7 +80,7 @@ def _classify(path: Path, now: float):
         age_days = (now - stat.st_mtime) / 86400
         name = path.name.lower()
         suffix = path.suffix.lower()
-        normalized = str(path).lower().replace("/", "\")
+        normalized = str(path).lower().replace("/", "\\")
         if _is_protected(path):
             return "KEEP", "Protected Windows/system/program location or system file", "HIGH"
         if name in _SAFE_JUNK_NAMES:
@@ -234,6 +234,11 @@ def _write_report(report: dict) -> Path:
         if app["install_location"]:
             lines.append(f"  {app['install_location']}")
     _REPORT_TXT.write_text("\n".join(lines), encoding="utf-8")
+    if os.name == "nt" and write_notepad:
+        try:
+            subprocess.Popen(["notepad.exe", str(_REPORT_TXT)])
+        except OSError:
+            pass
     return _REPORT_TXT
 
 
