@@ -186,7 +186,7 @@ def _installed_apps() -> list[dict]:
         return []
 
 
-def _write_report(report: dict) -> Path:
+def _write_report(report: dict, write_notepad: bool = True) -> Path:
     _REPORT_DIR.mkdir(parents=True, exist_ok=True)
     _REPORT_JSON.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     safe = [x for x in report["files"] if x["classification"] == "SAFE_DELETE"]
@@ -272,7 +272,7 @@ def audit_computer(write_notepad: bool = True, include_apps: bool = True) -> str
             "apps": apps,
             "elapsed_seconds": round(time.time() - started, 1),
         }
-        path = _write_report(report)
+        path = _write_report(report, write_notepad)
         _progress(drives[-1] if drives else Path.home(), 0, stats["files"], len(findings), started, "DONE")
         elapsed = report["elapsed_seconds"]
         safe_n = sum(x["classification"] == "SAFE_DELETE" for x in findings)
