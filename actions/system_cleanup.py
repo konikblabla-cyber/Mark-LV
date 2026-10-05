@@ -1,16 +1,12 @@
-"""Whole-computer cleanup audit.
-
-This module is deliberately audit-first: it scans accessible local drives,
-finds plausible cleanup candidates, lists installed Windows applications, and
-writes a human-readable report. It never deletes files or uninstalls software
-as part of the audit.
-"""
+"""Full-disk cleanup audit for JARVIS."""
 from __future__ import annotations
 
 import ctypes
 import json
 import os
+import shutil
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,16 +14,15 @@ from pathlib import Path
 _REPORT_DIR = Path.home() / "JARVIS" / "cleanup_reports"
 _REPORT_JSON = _REPORT_DIR / "latest_cleanup.json"
 _REPORT_TXT = _REPORT_DIR / "latest_cleanup.txt"
+_PROGRESS_TXT = _REPORT_DIR / "full_disk_scan_progress.txt"
 
-_SKIP_DIRS = {
-    "$recycle.bin", "system volume information", "windows",
-    "program files", "program files (x86)", "programdata", "recovery",
-    "appdata", "node_modules", ".git", ".venv", "venv"
-}
+_SKIP_DIRS = {"$recycle.bin", "system volume information", "windows", "program files", "program files (x86)", "programdata", "recovery", "appdata", "node_modules", ".git", ".venv", "venv"}
 _JUNK_NAMES = {"thumbs.db", "desktop.ini", "ehthumbs.db"}
 _JUNK_SUFFIXES = {".tmp", ".temp", ".dmp", ".old", ".bak", ".crdownload", ".part"}
 _INSTALLER_SUFFIXES = {".exe", ".msi", ".msix", ".iso", ".img"}
 _CACHE_MARKERS = ("cache", "temp", "tmp", "crashdumps", "wer")
+_SCAN_LOCK = threading.Lock()
+_SCAN_RUNNING = False
 
 
 def _size(n: int) -> str:
@@ -43,17 +38,13 @@ def _drives() -> list[Path]:
     if os.name != "nt":
         return [Path("/")]
     mask = ctypes.windll.kernel32.GetLogicalDrives()
-    result = []
+    drives = []
     for i in range(26):
         if mask & (1 << i):
             root = Path(f"{chr(65 + i)}:/")
             if root.exists():
-                result.append(root)
-    return result or [Path.home()]
-
-
-def _skip_dir(path: Path) -> bool:
-    return path.name.lower() in _SKIP_DIRS
+                drives.append(root)
+    return drives or [Path.home()]
 
 
 def _classify(path: Path, now: float):
@@ -78,18 +69,39 @@ def _classify(path: Path, now: float):
     return None
 
 
-def _scan(root: Path, candidates: list[dict], stats: dict):
-    now = time.time()
+def _progress(drive: Path, drive_files: int, total_files: int, candidates: int, started: float, status: str = "SCANNING"):
+    elapsed = max(time.time() - started, 0.001)
+    rate = total_files / elapsed
+    text = (
+        "JARVIS — FULL DISK SCAN\n"
+        f"Status: {status}\n"
+        f"Aktualny dysk: {drive}\n"
+        f"Pliki na aktualnym dysku: {drive_files:,}\n"
+        f"Pliki łącznie: {total_files:,}\n"
+        f"Kandydaci: {candidates:,}\n"
+        f"Prędkość: {rate:,.0f} plików/s\n"
+        f"Czas: {int(elapsed // 60):02d}:{int(elapsed % 60):02d}\n"
+        f"Ostatnia aktualizacja: {datetime.now().strftime('%H:%M:%S')}\n"
+    )
     try:
-        for dirpath, dirnames, filenames in os.walk(root, topdown=True, onerror=lambda _e: None):
-            dirnames[:] = [d for d in dirnames if not _skip_dir(Path(dirpath) / d)]
-            stats["directories"] += 1
-            for filename in filenames:
-                path = Path(dirpath) / filename
-                stats["files"] += 1
-                result = _classify(path, now)
-                if not result:
-                    continue
+        _REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        _PROGRESS_TXT.write_text(text, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _scan(root: Path, candidates: list[dict], stats: dict, started: float):
+    now = time.time()
+    drive_files = 0
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True, onerror=lambda _e: None):
+        dirnames[:] = [d for d in dirnames if d.lower() not in _SKIP_DIRS]
+        stats["directories"] += 1
+        for filename in filenames:
+            path = Path(dirpath) / filename
+            stats["files"] += 1
+            drive_files += 1
+            result = _classify(path, now)
+            if result:
                 try:
                     stat = path.stat()
                     kind, reason = result
@@ -102,9 +114,10 @@ def _scan(root: Path, candidates: list[dict], stats: dict):
                         "reason": reason,
                     })
                 except (OSError, PermissionError):
-                    continue
-    except (OSError, PermissionError):
-        pass
+                    pass
+            if drive_files % 500 == 0:
+                _progress(root, drive_files, stats["files"], len(candidates), started)
+    _progress(root, drive_files, stats["files"], len(candidates), started)
 
 
 def _installed_apps() -> list[dict]:
@@ -124,13 +137,7 @@ def _installed_apps() -> list[dict]:
             if not name or name.lower() in seen:
                 continue
             seen.add(name.lower())
-            apps.append({
-                "id": f"A{len(apps) + 1:05d}",
-                "name": name,
-                "version": str(row.get("DisplayVersion") or ""),
-                "publisher": str(row.get("Publisher") or ""),
-                "install_location": str(row.get("InstallLocation") or ""),
-            })
+            apps.append({"id": f"A{len(apps) + 1:05d}", "name": name, "version": str(row.get("DisplayVersion") or ""), "publisher": str(row.get("Publisher") or ""), "install_location": str(row.get("InstallLocation") or "")})
         return sorted(apps, key=lambda x: x["name"].lower())
     except Exception:
         return []
@@ -140,24 +147,24 @@ def _write_report(report: dict) -> Path:
     _REPORT_DIR.mkdir(parents=True, exist_ok=True)
     _REPORT_JSON.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     lines = [
-        "JARVIS — AUDYT CZYSZCZENIA KOMPUTERA",
+        "JARVIS — PEŁNY AUDYT WSZYSTKICH DYSKÓW",
         f"Data: {report['created_at']}",
-        f"Dyski: {report['stats']['drives']}",
-        f"Przeskanowane pliki: {report['stats']['files']}",
-        f"Kandydaci do sprawdzenia: {len(report['files'])}",
+        f"Dyski: {', '.join(report['drive_names'])}",
+        f"Przeskanowane katalogi: {report['stats']['directories']:,}",
+        f"Przeskanowane pliki: {report['stats']['files']:,}",
+        f"Kandydaci do sprawdzenia: {len(report['files']):,}",
+        f"Zainstalowane programy: {len(report['apps']):,}",
         "",
-        "WAŻNE: stary plik nie oznacza automatycznie, że jest niepotrzebny.",
-        "Lista jest propozycją do ręcznego zatwierdzenia.",
+        "WAŻNE: stary/duży plik NIE oznacza automatycznie, że jest niepotrzebny.",
+        "Raport jest listą propozycji do ręcznego zatwierdzenia.",
         "",
-        "=== PLIKI ===",
+        "=== PODSUMOWANIE DYSKÓW ===",
     ]
+    for d in report["disks"]:
+        lines.append(f"{d['drive']} | wolne: {_size(d['free'])} | zajęte: {_size(d['used'])} | razem: {_size(d['total'])}")
+    lines += ["", "=== PLIKI DO SPRAWDZENIA ==="]
     for item in report["files"]:
-        lines += [
-            f"[{item['id']}] {item['type']} | {_size(item['size'])} | {item['modified']}",
-            f"  {item['path']}",
-            f"  Powód: {item['reason']}",
-            "",
-        ]
+        lines += [f"[{item['id']}] {item['type']} | {_size(item['size'])} | {item['modified']}", f"  {item['path']}", f"  Powód: {item['reason']}", ""]
     lines += ["=== ZAINSTALOWANE PROGRAMY ===", ""]
     for app in report["apps"]:
         lines.append(f"[{app['id']}] {app['name']} {app['version']} | {app['publisher']}")
@@ -168,50 +175,71 @@ def _write_report(report: dict) -> Path:
 
 
 def audit_computer(write_notepad: bool = True, include_apps: bool = True) -> str:
-    candidates = []
+    global _SCAN_RUNNING
+    with _SCAN_LOCK:
+        if _SCAN_RUNNING:
+            return f"FULL DISK SCAN już trwa. Postęp: {_PROGRESS_TXT}"
+        _SCAN_RUNNING = True
+    started = time.time()
+    candidates, disks = [], []
     stats = {"drives": 0, "directories": 0, "files": 0}
-    for drive in _drives():
-        stats["drives"] += 1
-        _scan(drive, candidates, stats)
-    apps = _installed_apps() if include_apps else []
-    report = {
-        "created_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
-        "stats": stats,
-        "files": candidates,
-        "apps": apps,
-    }
-    path = _write_report(report)
-    message = f"Audyt gotowy: {stats['drives']} dyski, {stats['files']} plików, {len(candidates)} kandydatów, {len(apps)} programów. Raport: {path}"
-    if write_notepad and os.name == "nt":
-        try:
-            subprocess.Popen(["notepad.exe", str(path)])
-            message += " Raport otwarty w Notatniku."
-        except Exception:
-            message += " Raport zapisany, ale nie udało się otworzyć Notatnika."
-    return message
+    drives = _drives()
+    try:
+        for drive in drives:
+            stats["drives"] += 1
+            try:
+                du = shutil.disk_usage(drive)
+                disks.append({"drive": str(drive), "total": du.total, "free": du.free, "used": du.used})
+            except OSError:
+                pass
+            _progress(drive, 0, stats["files"], len(candidates), started)
+            _scan(drive, candidates, stats, started)
+        apps = _installed_apps() if include_apps else []
+        report = {
+            "created_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+            "drive_names": [str(d) for d in drives],
+            "disks": disks,
+            "stats": stats,
+            "files": candidates,
+            "apps": apps,
+            "elapsed_seconds": round(time.time() - started, 1),
+        }
+        path = _write_report(report)
+        _progress(drives[-1] if drives else Path.home(), 0, stats["files"], len(candidates), started, "DONE")
+        elapsed = report["elapsed_seconds"]
+        message = (f"FULL DISK SCAN zakończony: {stats['drives']} dyski, {stats['directories']:,} katalogów, "
+                   f"{stats['files']:,} plików, {len(candidates):,} kandydatów, {len(apps):,} programów. "
+                   f"Czas: {int(elapsed // 60):02d}:{int(elapsed % 60):02d}. Raport: {path}")
+        if write_notepad and os.name == "nt":
+            try:
+                subprocess.Popen(["notepad.exe", str(path)])
+                message += " Raport otwarty w Notatniku."
+            except Exception:
+                message += " Raport zapisany, ale nie udało się otworzyć Notatnika."
+        return message
+    finally:
+        with _SCAN_LOCK:
+            _SCAN_RUNNING = False
 
 
 def system_cleanup(parameters: dict = None, **_ctx) -> str:
     params = parameters or {}
-    action = str(params.get("action", "audit")).strip().lower()
-    if action == "audit":
-        return audit_computer(
-            write_notepad=bool(params.get("write_notepad", True)),
-            include_apps=bool(params.get("include_apps", True)),
-        )
+    action = str(params.get("action", "full_disk_scan")).strip().lower()
+    if action in {"audit", "full_disk_scan", "scan_all_disks", "scan"}:
+        return audit_computer(bool(params.get("write_notepad", True)), bool(params.get("include_apps", True)))
     if action in {"cleanup", "uninstall"}:
-        return "This action is intentionally approval-gated. First review latest_cleanup.txt and explicitly approve the exact file/app IDs; the audit itself never deletes or uninstalls anything."
+        return "Approval required: review latest_cleanup.txt and explicitly approve exact file/app IDs before deletion or uninstall."
     return f"Unknown action: {action}"
 
 
 TOOL = {
     "name": "system_cleanup",
-    "description": "Scans the entire accessible computer, finds plausible junk/stale files, lists installed Windows applications, and writes a detailed Notepad report. The audit never deletes or uninstalls anything.",
+    "description": "FULL DISK SCAN: scans every accessible Windows logical drive from root to bottom, reports live progress, counts files/directories, records disk usage, finds plausible stale/junk candidates, lists installed applications, and opens a detailed Notepad report. Never deletes or uninstalls during scanning.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
-            "action": {"type": "STRING", "description": "audit | cleanup | uninstall"},
-            "write_notepad": {"type": "BOOLEAN", "description": "Open the report in Notepad on Windows"},
+            "action": {"type": "STRING", "description": "full_disk_scan | audit | scan_all_disks | cleanup | uninstall"},
+            "write_notepad": {"type": "BOOLEAN", "description": "Open the completed report in Notepad on Windows"},
             "include_apps": {"type": "BOOLEAN", "description": "Include installed Windows applications"},
         },
         "required": ["action"],
